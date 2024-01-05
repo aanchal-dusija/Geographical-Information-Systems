@@ -1,0 +1,349 @@
+---
+title: "HW 5.2"
+date: last-modified
+data-format: long
+format:
+  html:
+    toc: true
+    code-fold: true
+execute: 
+  echo: true
+  message: false
+  warning: false
+embed-resources: true
+---
+
+**Author**: Aanchal Dusija
+
+
+```{r}
+# Check if XQuartz is installed and running
+system("pgrep -x Xquartz")
+
+# Check if OpenGL is enabled
+capabilities("opengl")
+
+# Check if rgl is loaded
+loadedPackages <- search()
+if("rgl" %in% loadedPackages) {
+  library(rgl)
+}
+
+```
+
+```{r}
+#| include: false
+options(rgl.useNULL=FALSE)
+library(rayshader) 
+library(tidyverse)
+library(rgl)
+library(rgdal)
+library(sp)
+```
+
+
+# Evaluating flood risk prone areas with Rayshader
+
+## Introduction
+
+Adapted from: <https://wcmbishop.github.io/rayshader-demo/>
+
+Use a tool like <https://geojson.io> to find the right bounding box for your map of interest.
+
+Find the coordinates and enter them here:
+
+```{r}
+library(leaflet)
+
+# define bounding box with longitude/latitude coordinates
+# south beach Miami
+# bbox <- list(
+#   p1 = list(long = -80.1174, lat = 25.7177),
+#   p2 = list(long = -80.2136, lat = 25.8089)
+# )
+
+# Florida Keys
+# bbox <- list(
+#   p1 = list(long = -80.5054, lat = 25.0293),
+#   p2 = list(long = -80.7928, lat = 24.8462)
+# )
+
+# san jose
+# bbox <- list(
+#   p1 = list(long = -121.8033, lat = 37.2732),
+#   p2 = list(long = -122.1459, lat = 37.4816)
+# )
+
+# Boston
+# # Boston
+# bbox <- list(
+#   p1 = list(long = -71.1912, lat = 42.2279),
+#   p2 = list(long = -70.9228, lat = 42.3969)
+# )
+
+# New York City
+# bbox <- list(
+#   p1 = list(long = -74.2591, lat = 40.4774),
+#   p2 = list(long = -73.7002, lat = 40.9176)
+# )
+
+# LA
+bbox <- list(
+p1 = list(long = -118.6682, lat = 33.7037),
+p2 = list(long = -118.1553, lat = 34.3373)
+)
+
+
+```
+
+Now, use Leaflet to confirm you have the map area you intended
+
+```{r}
+library(leaflet)
+library(webshot)
+
+leaflet_map <- leaflet() %>%
+  addTiles() %>% 
+  addRectangles(
+    lng1 = bbox$p1$long, lat1 = bbox$p1$lat,
+    lng2 = bbox$p2$long, lat2 = bbox$p2$lat,
+    fillColor = "transparent"
+  ) %>%
+  fitBounds(
+    lng1 = bbox$p1$long, lat1 = bbox$p1$lat,
+    lng2 = bbox$p2$long, lat2 = bbox$p2$lat,
+  )
+
+# Convert the leaflet map to an HTML file
+html_file_name <- "leaflet_map.html"
+htmlwidgets::saveWidget(leaflet_map, file = html_file_name)
+
+# Save the HTML file as a .png file
+png_file_name <- "leaflet_map.png"
+webshot(html_file_name, file = png_file_name)
+
+
+
+```
+
+## Elevation data
+
+Define the image size that will be used to download the associated elevation data.
+
+Function that is designed in the online tutorial:
+
+```{r}
+#https://github.com/wcmbishop/rayshader-demo/blob/master/R/image-size.R
+define_image_size <- function(bbox, major_dim = 400) {
+  # calculate aspect ration (width/height) from lat/long bounding box
+  aspect_ratio <- abs((bbox$p1$long - bbox$p2$long) / (bbox$p1$lat - bbox$p2$lat))
+  # define dimensions
+  img_width <- ifelse(aspect_ratio > 1, major_dim, major_dim*aspect_ratio) %>% round()
+  img_height <- ifelse(aspect_ratio < 1, major_dim, major_dim/aspect_ratio) %>% round()
+  size_str <- paste(img_width, img_height, sep = ",")
+  list(height = img_height, width = img_width, size = size_str)
+}
+
+image_size <- define_image_size(bbox, major_dim = 600)
+```
+
+Download elevation data from USGS elevation API.
+
+Helpful function provided in online tutorial:
+
+```{r}
+#https://github.com/wcmbishop/rayshader-demo/blob/master/R/elevation-api.R
+get_usgs_elevation_data <- function(bbox, size = "400,400", file = NULL, 
+                                    sr_bbox = 4326, sr_image = 4326) {
+  require(httr)
+  
+  # TODO - validate inputs
+  
+  url <- parse_url("https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage")
+  res <- GET(
+    url, 
+    query = list(
+      bbox = paste(bbox$p1$long, bbox$p1$lat, bbox$p2$long, bbox$p2$lat,
+                   sep = ","),
+      bboxSR = sr_bbox,
+      imageSR = sr_image,
+      size = size,
+      format = "tiff",
+      pixelType = "F32",
+      noDataInterpretation = "esriNoDataMatchAny",
+      interpolation = "+RSP_BilinearInterpolation",
+      f = "json"
+    )
+  )
+  
+  if (status_code(res) == 200) {
+    body <- content(res, type = "application/json")
+    img_res <- GET(body$href)
+    img_bin <- content(img_res, "raw")
+    if (is.null(file)) 
+      file <- tempfile("elev_matrix", fileext = ".tif")
+    writeBin(img_bin, file)
+    message(paste("image saved to file:", file))
+  } else {
+    warning(res)
+  }
+  invisible(file)
+}
+
+```
+
+Pull the elevation data
+
+```{r}
+elev_file <- file.path("elevation.tif")
+get_usgs_elevation_data(bbox, size = image_size$size, file = elev_file,
+                        sr_bbox = 4326, sr_image = 4326)
+```
+
+## 2d mapping
+
+Load the elevation data and plot it in 2d
+
+```{r}
+# load elevation data
+elev_img <- raster::raster(elev_file)
+elev_matrix <- matrix(
+  raster::extract(elev_img, raster::extent(elev_img), buffer = 1000), 
+  nrow = ncol(elev_img), ncol = nrow(elev_img)
+)
+
+# calculate rayshader layers
+ambmat <- ambient_shade(elev_matrix, zscale = 30)
+raymat <- ray_shade(elev_matrix, zscale = 30, lambert = TRUE)
+watermap <- detect_water(elev_matrix)
+
+# plot 2D
+elev_matrix %>%
+  sphere_shade(texture = "imhof4") %>%
+  add_water(watermap, color = "imhof4") %>%
+  #add_shadow(raymat, max_darken = 0.5) %>%
+  #add_shadow(ambmat, max_darken = 0.5) %>%
+  plot_map()
+```
+
+## 3d mapping
+
+```{r}
+overlay_file <- "leaflet_map.png"
+# get_arcgis_map_image(bbox, map_type = "World_Topo_Map", file = overlay_file,
+#                      width = image_size$width, height = image_size$height, 
+#                      sr_bbox = 4326)
+overlay_img <- png::readPNG(overlay_file)
+# overlay_img
+```
+
+```{r}
+
+find_image_coordinates <- function(long, lat, bbox, image_width, image_height) {
+  x_img <- round(image_width * (long - min(bbox$p1$long, bbox$p2$long)) / abs(bbox$p1$long - bbox$p2$long))
+  y_img <- round(image_height * (lat - min(bbox$p1$lat, bbox$p2$lat)) / abs(bbox$p1$lat - bbox$p2$lat))
+  list(x = x_img, y = y_img)
+}
+
+label <- list(text = "Long Beach")
+label$pos <- find_image_coordinates(
+  long = -118.2386878, lat = 33.8001805, bbox = bbox,
+  image_width = image_size$width, image_height = image_size$height)
+
+label1 <- list(text = "LAX")
+label1$pos <- find_image_coordinates(
+  long = -118.4085, lat = 33.9416, bbox = bbox,
+  image_width = image_size$width, image_height = image_size$height)
+
+
+zscale <- 10
+rgl::clear3d()
+elev_matrix %>% 
+  sphere_shade(texture = "imhof4") %>% 
+  add_water(watermap, color = "imhof4") %>%
+  add_overlay(overlay_img, alphalayer = 0.5) %>%
+  add_shadow(raymat, max_darken = 0.5) %>%
+  add_shadow(ambmat, max_darken = 0.5) %>%
+  plot_3d(elev_matrix, zscale = zscale, windowsize = c(1200, 1000),
+          water = TRUE, soliddepth = -max(elev_matrix)/zscale, wateralpha = 0,
+          theta = 25, phi = 30, zoom = 0.65, fov = 60)
+# add label
+render_label(elev_matrix, x = label$pos$x, y = label$pos$y, z = 500, 
+             zscale = zscale, text = label$text, textsize = 2, linewidth = 5)
+
+render_label(elev_matrix, x = label1$pos$x, y = label1$pos$y, z = 500,
+             zscale = zscale, text = label1$text, textsize = 2, linewidth = 5)
+render_snapshot()
+
+```
+
+## "Moving" 3d maps
+
+Sea level rise projections for major world cities - <https://earth.org/sea-level-rise-projections/>
+
+Rather than just a single 3d map, you can make a gif!
+
+```{r, message = FALSE, warning = FALSE}
+find_image_coordinates <- function(long, lat, bbox, image_width, image_height) {
+  x_img <- round(image_width * (long - min(bbox$p1$long, bbox$p2$long)) / abs(bbox$p1$long - bbox$p2$long))
+  y_img <- round(image_height * (lat - min(bbox$p1$lat, bbox$p2$lat)) / abs(bbox$p1$lat - bbox$p2$lat))
+  list(x = x_img, y = y_img)
+}
+
+label <- list(text = "Long Beach")
+label$pos <- find_image_coordinates(
+  long = -118.4676078, lat = 33.7998166, bbox = bbox,
+  image_width = image_size$width, image_height = image_size$height)
+
+label1 <- list(text = "LAX")
+label1$pos <- find_image_coordinates(
+  long = -118.4085, lat = 33.9416, bbox = bbox,
+  image_width = image_size$width, image_height = image_size$height)
+
+# Chaning n_frames from 100 to 200 for slowing down rotation of the camera angle
+n_frames <- 200
+zscale <- 30
+# frame transition variables
+# Changing waterdepthvalues: For Adjusting the water depth range to provide interesting water depth changes
+# waterdepthvalues <- mean(elev_matrix)*1 - mean(elev_matrix)* 1.5 * cos(seq(0,2*pi,length.out = n_frames))
+waterdepthvalues <- mean(elev_matrix) * 1 - mean(elev_matrix) * 2.5 * cos(seq(0, 2 * pi, length.out = n_frames))
+
+thetavalues <- -90 + 45 * cos(seq(0, 2*pi, length.out = n_frames))
+
+# shadow layers
+#ambmat <- ambient_shade(elev_matrix, zscale = zscale)
+#raymat <- ray_shade(elev_matrix, zscale = zscale, lambert = TRUE)
+
+# generate .png frame images
+img_frames <- paste0("drain", seq_len(n_frames), ".png")
+for (i in seq_len(n_frames)) {
+  message(paste(" - image", i, "of", n_frames))
+  elev_matrix %>%
+    sphere_shade(texture = "imhof4") %>%
+    add_water(watermap, color = "imhof3") %>%
+    #add_shadow(ambmat, 0.5)  %>%
+    #add_shadow(raymat, 0.5) %>%
+  add_overlay(overlay_img, alphalayer = 0.5) %>%
+    plot_3d(elev_matrix, solid = TRUE, shadow = TRUE, zscale = zscale, 
+            water = TRUE, watercolor = "imhof3", wateralpha = 0.8, 
+            waterlinecolor = "#ffffff", waterlinealpha = 0.5,
+            waterdepth = waterdepthvalues[i]/zscale, 
+            theta = thetavalues[i], phi = 45)
+  render_label(elev_matrix, x = label$pos$x, y = label$pos$y, z = 500, 
+             zscale = zscale, text = label$text, textsize = 2, linewidth = 5)
+
+  render_label(elev_matrix, x = label1$pos$x, y = label1$pos$y, z = 500,
+             zscale = zscale, text = label1$text, textsize = 2, linewidth = 5)
+  render_snapshot(img_frames[i])
+  rgl::clear3d()
+}
+
+# build gif
+magick::image_write_gif(magick::image_read(img_frames), 
+                        path = "water_rise1.gif", 
+                        delay = 6/n_frames)
+
+```
+
+
+![](water_rise1.gif)
